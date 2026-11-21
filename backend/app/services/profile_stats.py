@@ -15,15 +15,23 @@ class ProfileStatsService(BaseModuleService):
     MODULE = "profile_stats"
     ENTITY = "数据画像"
     OPERATION_TERM = "采集"
-    LIST_FIELDS = ["画像编号", "目标资产", "行数统计", "空值比例", "区分度", "分布类型", "离群阈值", "画像时间"]
+    LIST_FIELDS = ["画像编号", "采集批次", "目标资产", "行数统计", "空值比例", "区分度", "分布类型", "画像时间"]
     REQUIRED_FIELDS = ["画像编号", "目标资产", "行数统计"]
     STATUS_ORDER = ["待采集", "采集中", "可用", "采集异常"]
     ACTION_RULES = {"启动采集": "采集中", "标记可用": "可用", "标记异常": "采集异常"}
     NEGATIVE_ACTIONS = []
 
-    def profile_dataset(self, asset_code: str, sample_data: list[dict[str, Any]]) -> dict[str, Any]:
-        """对数据集执行画像分析并自动触发分级（Pipeline 2 入口）。"""
+    def profile_dataset(self, asset_code: str, sample_data: list[dict[str, Any]], *,
+                        batch_id: str | None = None,
+                        quality_metrics: dict[str, float] | None = None) -> dict[str, Any]:
+        """对数据集执行画像分析并自动触发分级（Pipeline 2 入口）。
+
+        batch_id 为采集批次标识，缺省按画像序号生成；同一资产可产生多个批次，
+        质量调度按批次选择指标。quality_metrics 携带本批次实测的资产质量指标，
+        如 {"完整性": 99.0, "准确性": 93.0}。
+        """
         profile_id = store.next_id(self.MODULE)
+        batch_code = batch_id or f"BATCH-{asset_code}-{profile_id:04d}"
         total_rows = len(sample_data)
 
         # 计算列统计
@@ -46,6 +54,7 @@ class ProfileStatsService(BaseModuleService):
         entry = {
             "id": profile_id,
             "画像编号": f"PROF-{profile_id:04d}",
+            "采集批次": batch_code,
             "目标资产": asset_code,
             "行数统计": str(total_rows),
             "空值比例": str(round(sum(f["null_ratio"] for f in field_stats.values()) / max(len(field_stats), 1), 4)),
@@ -53,6 +62,7 @@ class ProfileStatsService(BaseModuleService):
             "分布类型": "uniform" if len(field_stats) > 0 else "empty",
             "离群阈值": "3sigma",
             "画像时间": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "质量指标": dict(quality_metrics or {}),
             "status": "可用",
             "pending": False,
             "abnormal": False,
@@ -124,8 +134,43 @@ class ProfileStatsService(BaseModuleService):
         return labels
 
     def get_profile_by_asset(self, asset_code: str) -> dict[str, Any] | None:
-        """按资产查询画像。"""
+        """按资产查询画像（返回最早一个，兼容旧调用）。"""
         for row in store.rows(self.MODULE):
             if row.get("目标资产") == asset_code:
                 return row
         return None
+
+    def list_profiles_by_asset(self, asset_code: str) -> list[dict[str, Any]]:
+        """按资产列出全部画像批次（按入库顺序，即批次先后）。"""
+        return [row for row in store.rows(self.MODULE) if row.get("目标资产") == asset_code]
+
+
+def profile_batch_of(profile: dict[str, Any]) -> str:
+    """读取画像的采集批次标识，兼容没有该字段的历史画像批次。"""
+    batch = profile.get("采集批次")
+    if batch:
+        return str(batch)
+    return f"PROF-{profile.get('id', 0):04d}"
+
+
+def resolve_profile_batch(asset_code: str, check_type: str) -> dict[str, Any] | None:
+    """定位某资产某质量指标实际取自哪个画像采集批次。
+
+    沿调度调用链送入规则的测点在这里解析：从该资产最新可用的画像批次向前找，
+    返回第一个携带该指标的批次；历史画像没有「质量指标」字段时自然跳过。
+    """
+    profiles = [
+        row for row in store.rows("profile_stats")
+        if row.get("目标资产") == asset_code and row.get("质量指标")
+    ]
+    for profile in reversed(profiles):
+        metrics = profile.get("质量指标") or {}
+        if check_type in metrics:
+            return {
+                "采集批次": profile_batch_of(profile),
+                "画像编号": profile.get("画像编号"),
+                "检查类型": check_type,
+                "实测值": metrics[check_type],
+                "画像时间": profile.get("画像时间"),
+            }
+    return None
